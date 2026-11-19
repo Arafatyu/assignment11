@@ -1,372 +1,154 @@
 # app/models/calculation.py
 """
-Calculation Models with Polymorphic Inheritance
+Calculation model with single-table polymorphic inheritance and a factory.
 
-This module demonstrates SQLAlchemy's polymorphic inheritance pattern, where
-multiple calculation types (Addition, Subtraction, Multiplication, Division)
-inherit from a base Calculation model. This is a powerful ORM feature that
-allows different types of calculations to be stored in the same table while
-maintaining type-specific behavior.
-
-Polymorphic Inheritance Explained:
-- Single Table Inheritance: All calculation types share one table
-- Discriminator Column: The 'type' column determines which class to use
-- Polymorphic Identity: Each subclass has a unique identifier
-- Factory Pattern: Calculation.create() returns the appropriate subclass
-
-This design pattern allows for:
-1. Querying all calculations together: session.query(Calculation).all()
-2. Automatic type resolution: SQLAlchemy returns the correct subclass
-3. Type-specific behavior: Each subclass implements get_result() differently
-4. Easy extensibility: Add new calculation types by creating new subclasses
+Design decisions:
+- One table ("calculations") holds every calculation type.
+- The `type` column is the discriminator; SQLAlchemy returns the right
+  subclass (Addition, Subtraction, ...) when loading rows.
+- `a` and `b` are the two operands.
+- `result` is STORED when a calculation is created through the factory,
+  and get_result() can always recompute it on demand.
+- `user_id` is a foreign key to users.id (deleted with the user).
 """
 
-from datetime import datetime
 import uuid
-from typing import List
-from sqlalchemy import Column, String, DateTime, ForeignKey, JSON, Float
+from datetime import datetime, timezone
+
+from sqlalchemy import Column, DateTime, Float, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import relationship, declared_attr
-from app.database import Base
+from sqlalchemy.orm import relationship
+
+from app.models.user import Base
 
 
-class AbstractCalculation:
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Calculation(Base):
     """
-    Abstract base class defining common attributes for all calculations.
-    
-    This class uses SQLAlchemy's @declared_attr decorator to define columns
-    that will be shared across all calculation types. The @declared_attr
-    decorator is necessary when defining columns in a mixin class.
-    
-    Design Pattern: This follows the Template Method pattern, where the
-    abstract class defines the structure and subclasses provide specific
-    implementations.
+    Base calculation model.
+
+    Subclasses only override get_result() and set a polymorphic identity;
+    they share this table, so they don't define __tablename__.
     """
 
-    @declared_attr
-    def __tablename__(cls):
-        """All calculation types share the 'calculations' table"""
-        return 'calculations'
+    __tablename__ = "calculations"
 
-    @declared_attr
-    def id(cls):
-        """Unique identifier for each calculation (UUID for distribution)"""
-        return Column(
-            UUID(as_uuid=True),
-            primary_key=True,
-            default=uuid.uuid4,
-            nullable=False
-        )
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    a = Column(Float, nullable=False)
+    b = Column(Float, nullable=False)
+    type = Column(String(50), nullable=False, index=True)
+    result = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
 
-    @declared_attr
-    def user_id(cls):
-        """
-        Foreign key to the user who owns this calculation.
-        
-        CASCADE delete ensures calculations are deleted when user is deleted.
-        Index improves query performance when filtering by user_id.
-        """
-        return Column(
-            UUID(as_uuid=True),
-            ForeignKey('users.id', ondelete='CASCADE'),
-            nullable=False,
-            index=True
-        )
+    # Requires User to define: calculations = relationship("Calculation", back_populates="user")
+    user = relationship("User", back_populates="calculations")
 
-    @declared_attr
-    def type(cls):
-        """
-        Discriminator column for polymorphic inheritance.
-        
-        This column tells SQLAlchemy which subclass to instantiate when
-        loading records from the database. Values include: 'addition',
-        'subtraction', 'multiplication', 'division'.
-        """
-        return Column(
-            String(50),
-            nullable=False,
-            index=True
-        )
-
-    @declared_attr
-    def inputs(cls):
-        """
-        JSON column storing the list of numbers for the calculation.
-        
-        Using JSON allows for flexible storage of variable-length input lists.
-        PostgreSQL's native JSON support provides efficient querying and
-        indexing capabilities.
-        """
-        return Column(
-            JSON,
-            nullable=False
-        )
-
-    @declared_attr
-    def result(cls):
-        """
-        The computed result of the calculation.
-        
-        Stored as Float to handle decimal values. Can be NULL initially
-        and computed on-demand using get_result() method.
-        """
-        return Column(
-            Float,
-            nullable=True
-        )
-
-    @declared_attr
-    def created_at(cls):
-        """Timestamp when the calculation was created"""
-        return Column(
-            DateTime,
-            default=datetime.utcnow,
-            nullable=False
-        )
-
-    @declared_attr
-    def updated_at(cls):
-        """Timestamp when the calculation was last updated"""
-        return Column(
-            DateTime,
-            default=datetime.utcnow,
-            onupdate=datetime.utcnow,
-            nullable=False
-        )
-
-    @declared_attr
-    def user(cls):
-        """
-        Relationship to the User model.
-        
-        back_populates creates a bidirectional relationship, allowing access
-        to user.calculations and calculation.user.
-        """
-        return relationship("User", back_populates="calculations")
-
-    @classmethod
-    def create(cls, calculation_type: str, user_id: uuid.UUID,
-               inputs: List[float]) -> "Calculation":
-        """
-        Factory method to create the appropriate calculation subclass.
-        
-        This implements the Factory Pattern, which provides a centralized way
-        to create objects without specifying their exact class. The factory
-        determines which subclass to instantiate based on calculation_type.
-        
-        Benefits of Factory Pattern:
-        1. Encapsulation: Object creation logic is in one place
-        2. Flexibility: Easy to add new calculation types
-        3. Type Safety: Returns strongly-typed subclass instances
-        
-        Args:
-            calculation_type: Type of calculation (e.g., 'addition')
-            user_id: UUID of the user creating the calculation
-            inputs: List of numbers to calculate
-            
-        Returns:
-            An instance of the appropriate Calculation subclass
-            
-        Raises:
-            ValueError: If calculation_type is not supported
-            
-        Example:
-            calc = Calculation.create('addition', user_id, [1, 2, 3])
-            assert isinstance(calc, Addition)
-            assert calc.get_result() == 6
-        """
-        calculation_classes = {
-            'addition': Addition,
-            'subtraction': Subtraction,
-            'multiplication': Multiplication,
-            'division': Division,
-        }
-        calculation_class = calculation_classes.get(calculation_type.lower())
-        if not calculation_class:
-            raise ValueError(
-                f"Unsupported calculation type: {calculation_type}"
-            )
-        return calculation_class(user_id=user_id, inputs=inputs)
-
-    def get_result(self) -> float:
-        """
-        Abstract method to compute the calculation result.
-        
-        Each subclass must implement this method with its specific logic.
-        This follows the Template Method pattern where the interface is
-        defined here but implementation is deferred to subclasses.
-        
-        Raises:
-            NotImplementedError: If called on base class
-        """
-        raise NotImplementedError(
-            "Subclasses must implement get_result() method"
-        )
-
-    def __repr__(self):
-        return f"<Calculation(type={self.type}, inputs={self.inputs})>"
-
-
-class Calculation(Base, AbstractCalculation):
-    """
-    Base calculation model with polymorphic configuration.
-    
-    This class combines SQLAlchemy's Base with our AbstractCalculation mixin
-    and configures polymorphic inheritance through __mapper_args__.
-    
-    Polymorphic Configuration:
-    - polymorphic_on: Specifies the discriminator column (type)
-    - polymorphic_identity: The value stored for this base class
-    
-    When querying Calculation, SQLAlchemy automatically:
-    1. Reads the 'type' column value
-    2. Determines the appropriate subclass
-    3. Returns an instance of that subclass
-    """
     __mapper_args__ = {
         "polymorphic_on": "type",
         "polymorphic_identity": "calculation",
     }
 
+    # ------------------------------------------------------------------
+    # Factory
+    # ------------------------------------------------------------------
+    @classmethod
+    def create(cls, calculation_type: str, user_id: uuid.UUID,
+               a: float, b: float) -> "Calculation":
+        """
+        Factory: return the correct subclass for `calculation_type`.
+
+        Accepts (case-insensitive): addition/add, subtraction/sub/subtract,
+        multiplication/multiply, division/divide.
+
+        The result is computed and stored immediately, so invalid input
+        (e.g. dividing by zero) fails here rather than at commit time.
+
+        Raises:
+            ValueError: unsupported type, or invalid operands.
+        """
+        if not isinstance(calculation_type, str):
+            raise ValueError(f"Unsupported calculation type: {calculation_type}")
+
+        calculation_class = _CALCULATION_TYPES.get(calculation_type.strip().lower())
+        if calculation_class is None:
+            raise ValueError(f"Unsupported calculation type: {calculation_type}")
+
+        calculation = calculation_class(user_id=user_id, a=a, b=b)
+        calculation.result = calculation.get_result()
+        return calculation
+
+    # ------------------------------------------------------------------
+    # Behaviour
+    # ------------------------------------------------------------------
+    def _validate_operands(self) -> None:
+        for name in ("a", "b"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"Operand '{name}' must be a number.")
+
+    def get_result(self) -> float:
+        """Compute the result. Each subclass implements its own operation."""
+        raise NotImplementedError("Subclasses must implement get_result()")
+
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__}(a={self.a}, b={self.b}, result={self.result})>"
+
 
 class Addition(Calculation):
-    """
-    Addition calculation subclass.
-    
-    Polymorphic Identity: 'addition'
-    Operation: Sums all numbers in the inputs list
-    
-    Example:
-        add = Addition(user_id=user_id, inputs=[1, 2, 3])
-        result = add.get_result()  # Returns 6
-    """
     __mapper_args__ = {"polymorphic_identity": "addition"}
 
     def get_result(self) -> float:
-        """
-        Calculate the sum of all input numbers.
-        
-        Returns:
-            The sum of all inputs
-            
-        Raises:
-            ValueError: If inputs is not a list or has fewer than 2 numbers
-        """
-        if not isinstance(self.inputs, list):
-            raise ValueError("Inputs must be a list of numbers.")
-        if len(self.inputs) < 2:
-            raise ValueError(
-                "Inputs must be a list with at least two numbers."
-            )
-        return sum(self.inputs)
+        self._validate_operands()
+        return self.a + self.b
 
 
 class Subtraction(Calculation):
-    """
-    Subtraction calculation subclass.
-    
-    Polymorphic Identity: 'subtraction'
-    Operation: Subtracts subsequent numbers from the first number
-    
-    Example:
-        sub = Subtraction(user_id=user_id, inputs=[10, 3, 2])
-        result = sub.get_result()  # Returns 5 (10 - 3 - 2)
-    """
     __mapper_args__ = {"polymorphic_identity": "subtraction"}
 
     def get_result(self) -> float:
-        """
-        Subtract all subsequent numbers from the first number.
-        
-        Returns:
-            The result of sequential subtraction
-            
-        Raises:
-            ValueError: If inputs is not a list or has fewer than 2 numbers
-        """
-        if not isinstance(self.inputs, list):
-            raise ValueError("Inputs must be a list of numbers.")
-        if len(self.inputs) < 2:
-            raise ValueError(
-                "Inputs must be a list with at least two numbers."
-            )
-        result = self.inputs[0]
-        for value in self.inputs[1:]:
-            result -= value
-        return result
+        self._validate_operands()
+        return self.a - self.b
 
 
 class Multiplication(Calculation):
-    """
-    Multiplication calculation subclass.
-    
-    Polymorphic Identity: 'multiplication'
-    Operation: Multiplies all numbers in the inputs list
-    
-    Example:
-        mult = Multiplication(user_id=user_id, inputs=[2, 3, 4])
-        result = mult.get_result()  # Returns 24
-    """
     __mapper_args__ = {"polymorphic_identity": "multiplication"}
 
     def get_result(self) -> float:
-        """
-        Calculate the product of all input numbers.
-        
-        Returns:
-            The product of all inputs
-            
-        Raises:
-            ValueError: If inputs is not a list or has fewer than 2 numbers
-        """
-        if not isinstance(self.inputs, list):
-            raise ValueError("Inputs must be a list of numbers.")
-        if len(self.inputs) < 2:
-            raise ValueError(
-                "Inputs must be a list with at least two numbers."
-            )
-        result = 1
-        for value in self.inputs:
-            result *= value
-        return result
+        self._validate_operands()
+        return self.a * self.b
 
 
 class Division(Calculation):
-    """
-    Division calculation subclass.
-    
-    Polymorphic Identity: 'division'
-    Operation: Divides the first number by subsequent numbers sequentially
-    
-    Example:
-        div = Division(user_id=user_id, inputs=[100, 2, 5])
-        result = div.get_result()  # Returns 10 (100 / 2 / 5)
-        
-    Note: This implementation uses EAFP (Easier to Ask for Forgiveness than
-    Permission) by checking for zero during calculation rather than before.
-    """
     __mapper_args__ = {"polymorphic_identity": "division"}
 
     def get_result(self) -> float:
-        """
-        Divide the first number by all subsequent numbers sequentially.
-        
-        Returns:
-            The result of sequential division
-            
-        Raises:
-            ValueError: If inputs is not a list, has fewer than 2 numbers,
-                       or if attempting to divide by zero
-        """
-        if not isinstance(self.inputs, list):
-            raise ValueError("Inputs must be a list of numbers.")
-        if len(self.inputs) < 2:
-            raise ValueError(
-                "Inputs must be a list with at least two numbers."
-            )
-        result = self.inputs[0]
-        for value in self.inputs[1:]:
-            if value == 0:
-                raise ValueError("Cannot divide by zero.")
-            result /= value
-        return result
+        self._validate_operands()
+        if self.b == 0:
+            raise ValueError("Cannot divide by zero.")
+        return self.a / self.b
+
+
+# Registry used by the factory (full names plus short aliases).
+_CALCULATION_TYPES = {
+    "addition": Addition,
+    "add": Addition,
+    "subtraction": Subtraction,
+    "subtract": Subtraction,
+    "sub": Subtraction,
+    "multiplication": Multiplication,
+    "multiply": Multiplication,
+    "division": Division,
+    "divide": Division,
+}
